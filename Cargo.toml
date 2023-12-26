@@ -1,0 +1,20 @@
+[package]
+name = "scalefs-windowspnp"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/scalefs/scalefs-windowspnp-lib-rs"
+
+[dependencies]
+#libc = "0.2.151"
+
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.52.0"
+features = [
+    #
+]
+
+[target.'cfg(target_os = "windows")'.dependencies.windows-sys]
+version = "0.52.0"
+features = [
+    #    
+]
