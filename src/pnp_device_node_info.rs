@@ -2,8 +2,8 @@
 // Licensed under the MIT License
 
 use crate::{
-    DevicePropertyKey,
-    DevicePropertyValue,
+    PnpDevicePropertyKey,
+    PnpDevicePropertyValue,
 };
 use std::collections::HashMap;
 
@@ -15,15 +15,15 @@ pub struct PnpDeviceNodeInfo {
     pub container_id: Option<String>,
     //
     // device instance properties (optional; these should be available for all devices)
-    pub device_instance_properties: Option<HashMap<DevicePropertyKey, DevicePropertyValue>>,
+    pub device_instance_properties: Option<HashMap<PnpDevicePropertyKey, PnpDevicePropertyValue>>,
     //
     // device setup class properties (optional) (also, they are available for most devices but not ALL devices)
-    pub device_setup_class_properties: Option<HashMap<DevicePropertyKey, DevicePropertyValue>>,
+    pub device_setup_class_properties: Option<HashMap<PnpDevicePropertyKey, PnpDevicePropertyValue>>,
     //
     // device path (only applies to device interfaces; will be None otherwise)
     pub device_path: Option<String>,
     // interface properties (optional) (also, they only apply to device interfaces; will be None otherwise)
-    pub device_interface_properties: Option<HashMap<DevicePropertyKey, DevicePropertyValue>>,
+    pub device_interface_properties: Option<HashMap<PnpDevicePropertyKey, PnpDevicePropertyValue>>,
     // interface class properties (optional) (also, they only apply to device interfaces; will be None otherwise)
-    pub device_interface_class_properties: Option<HashMap<DevicePropertyKey, DevicePropertyValue>>,
+    pub device_interface_class_properties: Option<HashMap<PnpDevicePropertyKey, PnpDevicePropertyValue>>,
 }
