@@ -1,2 +1,2 @@
 # scalefs-windowspnp-lib-rs
-Windows PnP library (Rust)
+ScaleFS Windows PnP library (Rust)
