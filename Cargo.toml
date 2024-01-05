@@ -6,9 +6,9 @@ repository = "https://github.com/scalefs/scalefs-windowspnp-lib-rs"
 
 [dependencies]
 libc = "0.2.151"
-scalefs-common = { path = "../scalefs-common-lib-rs" }
-scalefs-primitives = { path = "../scalefs-primitives-lib-rs" }
-scalefs-uuid = { path = "../scalefs-uuid-lib-rs" }
+scalefs-common = "0.1.0"
+scalefs-primitives = "0.1.0"
+scalefs-uuid = "0.1.0"
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.52.0"
