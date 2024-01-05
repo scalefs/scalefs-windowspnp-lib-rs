@@ -5,7 +5,7 @@ edition = "2021"
 repository = "https://github.com/scalefs/scalefs-windowspnp-lib-rs"
 
 [dependencies]
-#libc = "0.2.151"
+libc = "0.2.151"
 scalefs-common = { path = "../scalefs-common-lib-rs" }
 scalefs-primitives = { path = "../scalefs-primitives-lib-rs" }
 scalefs-uuid = { path = "../scalefs-uuid-lib-rs" }

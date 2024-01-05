@@ -25,13 +25,26 @@ use windows::{
 use windows_sys::{
     core::GUID,
     Win32::Devices::DeviceAndDriverInstallation::{
+        DICLASSPROP_INSTALLER,
+        DICLASSPROP_INTERFACE,
         SPDRP_BASE_CONTAINERID,
+        SPDRP_CLASSGUID,
         HDEVINFO,
+        SP_DEVICE_INTERFACE_DATA,
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W,
         SP_DEVINFO_DATA,
         SetupDiDestroyDeviceInfoList, 
         SetupDiEnumDeviceInfo,
+        SetupDiEnumDeviceInterfaces,
         SetupDiGetClassDevsW,
+        SetupDiGetDeviceInterfaceDetailW,
+        SetupDiGetDeviceInterfacePropertyKeys,
+        SetupDiGetDeviceInterfacePropertyW,
+        SetupDiGetClassPropertyKeys,
+        SetupDiGetClassPropertyW,
         SetupDiGetDeviceInstanceIdW,
+        SetupDiGetDevicePropertyKeys,
+        SetupDiGetDevicePropertyW,
         SetupDiGetDeviceRegistryPropertyW,
     },
     Win32::Devices::Properties::{
@@ -46,6 +59,7 @@ use windows_sys::{
         DEVPROP_TYPEMOD_LIST,
         MAX_DEVPROP_TYPE,
         MAX_DEVPROP_TYPEMOD,
+        DEVPROPKEY,
         DEVPROPTYPE,
     },
     Win32::Foundation::INVALID_HANDLE_VALUE,
@@ -259,22 +273,300 @@ impl PnpEnumerator {
                     },
                 };
 
+                // NOTE: to capture the device manufacturer, device description and device friendly name strings, optionally use get_device_registry_property_value(...) to capture the following:
+                // - SPDRP_MFG - PnpDevicePropertyValue::String(...) - "manufacturer" (not necessarily the Manufacturer from the USB device descriptor)
+                // - SPDRP_DEVICEDESC - PnpDevicePropertyValue::String(...) - bus-provided "device description" (not necessarily the Product string from the USB device descriptor, although it matched when we test against one _container_ device instances); this might be missing/null for many devices... (TBD)
+                // - SPDRP_FRIENDLYNAME - PnpDevicePropertyValue::String(...) - "friendly name" used to refer to the device; this might be the string shown in Device Manager for a devnode, it might include additional data such as a port #, etc. (TBD)
+
+                // capture the device instance properties (and, where applicable/available, the device class and device interface properties)
+
+                let device_instance_properties: Option<HashMap::<PnpDevicePropertyKey, PnpDevicePropertyValue>>;
+                if include_instance_properties == true {
+                    let available_device_instance_property_keys = match get_device_instance_property_keys(handle_to_device_info_set, &mut devinfo_data) {
+                        Ok(value) => value,
+                        Err(GetDevicePropertyKeysError::Win32Error(win32_error)) => {
+                            debug_assert!(false, "BUG: could not get list of available property keys for the device instance");
+                            return Err(EnumerateError::Win32Error(win32_error));
+                        }
+                    };
+                    //
+                    let mut some_device_instance_properties = HashMap::<PnpDevicePropertyKey, PnpDevicePropertyValue>::new();
+                    for property_key in available_device_instance_property_keys {
+                        let property_value = match get_device_instance_property_value(handle_to_device_info_set, &mut devinfo_data, PnpDevicePropertyKey::from(property_key)) {
+                            Ok(value) => value,
+                            Err(GetDevicePropertyValueError::StringDecodingError(decoding_error)) => {
+                                return Err(EnumerateError::StringDecodingError(decoding_error))
+                            },
+                            Err(GetDevicePropertyValueError::StringListTerminationError) => {
+                                debug_assert!(false, "BUG: Win32 setupapi's list of strings was not properly terminated with an extra null terminator.");
+                                return Err(EnumerateError::StringTerminationDecodingError);
+                            },
+                            Err(GetDevicePropertyValueError::StringTerminationError) => {
+                                debug_assert!(false, "BUG: Win32 setupapi's string (or last string in list of strings) was not properly terminated with a null terminator.");
+                                return Err(EnumerateError::StringTerminationDecodingError);
+                            },
+                            Err(GetDevicePropertyValueError::Win32Error(win32_error)) => {
+                                return Err(EnumerateError::Win32Error(win32_error))
+                            },
+                        };
+                        some_device_instance_properties.insert(PnpDevicePropertyKey::from(property_key), property_value);
+                    }
+
+                    device_instance_properties = Some(some_device_instance_properties);
+                } else {
+                    // do not enumerate the device instance properties (EnumerateOption::IncludeInstanceProperties omitted)
+                    device_instance_properties = None;
+                }
+                
                 //
+
+                // option: capture the device setup class guid and device setup class properties for this devnode
+
+                let device_setup_class_properties: Option<HashMap<PnpDevicePropertyKey, PnpDevicePropertyValue>>;
+                if include_setup_class_properties == true {
+                    // for all devices: capture the device setup class guid of the device
+                    // NOTE: we might be able to get this data using the modern setup API by retrieving the device instance property "DEVPKEY_Device_ClassGuid"...which might be preferable to using the legacy device registry property value mechanism; note that we have not tested that DEVPKEY on interfaces
+                    let device_setup_class_guid_as_string = match get_device_registry_property_value(handle_to_device_info_set, &mut devinfo_data, SPDRP_CLASSGUID) {
+                        Ok(value) => {
+                            match value {
+                                PnpDevicePropertyValue::String(value_as_string) => Some(value_as_string),
+                                _ => None,
+                            }
+                        },
+                            Err(GetDevicePropertyValueError::StringDecodingError(decoding_error)) => {
+                            return Err(EnumerateError::StringDecodingError(decoding_error));
+                        },
+                        Err(GetDevicePropertyValueError::StringListTerminationError) => {
+                            debug_assert!(false, "BUG: Win32 setupapi's list of strings was not properly terminated with an extra null terminator.");
+                            return Err(EnumerateError::StringTerminationDecodingError);
+                        },
+                        Err(GetDevicePropertyValueError::StringTerminationError) => {
+                            debug_assert!(false, "BUG: Win32 setupapi's string (or last string in list of strings) was not properly terminated with a null terminator.");
+                            return Err(EnumerateError::StringTerminationDecodingError);
+                        },
+                        Err(GetDevicePropertyValueError::Win32Error(win32_error)) => {
+                            match windows::Win32::Foundation::WIN32_ERROR(win32_error) {
+                                ERROR_INVALID_DATA => {
+                                    // this is an expected error for root nodes; proceed
+                                    // NOTE: we may want to determine if the node was the root node (so that we don't simply omit device class properties in the wrong situations)
+                                    None
+                                },
+                                _ => {
+                                    return Err(EnumerateError::Win32Error(win32_error));
+                                }
+                            }
+                        },
+                    };
+                    let mut device_setup_class_guid: Option<GUID> = match device_setup_class_guid_as_string {
+                        Some(value_as_string) => {
+                            match Uuid::from_str(&value_as_string) {
+                                Ok(value_as_uuid) => Some(GUID::from_u128(value_as_uuid.as_u128())),
+                                Err(_) => None
+                            }
+                        },
+                        None => None,
+                    };
+                    //
+                    // if a setup class GUID was provided with this function, override device_setup_class_guid (although they SHOULD be identical)
+                    if let EnumerateSpecifier::DeviceSetupClassGuid(ref setup_class_guid) = enumerate_specifier {
+                        let wrapped_setup_class_guid = Some(*setup_class_guid);
+                        //
+                        match device_setup_class_guid {
+                            Some(some_device_setup_class_guid) => {
+                                if (setup_class_guid.data1 != some_device_setup_class_guid.data1) || (setup_class_guid.data2 != some_device_setup_class_guid.data2) || (setup_class_guid.data3 != some_device_setup_class_guid.data3) || (setup_class_guid.data4 != some_device_setup_class_guid.data4) {
+                                    debug_assert!(false, "Device setup class GUID provided to the enumeration function does not match the device setup class guid enumerated from the devnode");
+                                }
+                            },
+                            None => {
+                                debug_assert!(false, "Device setup class GUID provided to the enumeration function does not match the device setup class guid enumerated from the devnode") ;
+                            }
+                        }
+                        //
+                        device_setup_class_guid = wrapped_setup_class_guid;
+                    }
+                    
+                    //
+
+                    if let Some(get_device_setup_class_property_class_guid) = device_setup_class_guid {
+                        let available_device_setup_class_property_keys = match get_device_class_property_keys(&get_device_setup_class_property_class_guid, DeviceClassType::DeviceSetupClass) {
+                            Ok(value) => value,
+                            Err(GetDevicePropertyKeysError::Win32Error(win32_error)) => {
+                                debug_assert!(false, "BUG: could not get list of available property keys for the device setup class");
+                                return Err(EnumerateError::Win32Error(win32_error));
+                            }
+                        };
+        
+                        let mut some_device_setup_class_properties = HashMap::<PnpDevicePropertyKey, PnpDevicePropertyValue>::new();
+                        for property_key in available_device_setup_class_property_keys {
+                            let property_value = match get_device_class_property_value(&get_device_setup_class_property_class_guid, DeviceClassType::DeviceSetupClass, PnpDevicePropertyKey::from(property_key)) {
+                                Ok(value) => value,
+                                Err(GetDevicePropertyValueError::StringDecodingError(decoding_error)) => {
+                                    return Err(EnumerateError::StringDecodingError(decoding_error))
+                                },
+                                Err(GetDevicePropertyValueError::StringListTerminationError) => {
+                                    debug_assert!(false, "BUG: Win32 setupapi's list of strings was not properly terminated with an extra null terminator.");
+                                    return Err(EnumerateError::StringTerminationDecodingError);
+                                },
+                                Err(GetDevicePropertyValueError::StringTerminationError) => {
+                                    debug_assert!(false, "BUG: Win32 setupapi's string (or last string in list of strings) was not properly terminated with a null terminator.");
+                                    return Err(EnumerateError::StringTerminationDecodingError);
+                                },
+                                Err(GetDevicePropertyValueError::Win32Error(win32_error)) => {
+                                    return Err(EnumerateError::Win32Error(win32_error))
+                                },
+                            };
+                            some_device_setup_class_properties.insert(PnpDevicePropertyKey::from(property_key), property_value);
+                        }
+
+                        device_setup_class_properties = Some(some_device_setup_class_properties);
+                    } else {
+                        device_setup_class_properties = None;
+                    }
+                } else {
+                    // do not enumerate the device setup class properties (EnumerateOption::IncludeDeviceSetupClassProperties omitted)
+                    device_setup_class_properties = None;
+                }
+
                 //
+
+                // option: capture the device interface class properties for this devnode
+
+                let device_interface_class_properties: Option<HashMap<PnpDevicePropertyKey, PnpDevicePropertyValue>>;
+                if include_device_interface_class_properties == true {
+                    if let Some(get_device_interface_class_property_class_guid) = device_interface_class_guid {
+                        let available_device_interface_class_property_keys = match get_device_class_property_keys(get_device_interface_class_property_class_guid, DeviceClassType::DeviceInterfaceClass) {
+                            Ok(value) => value,
+                            Err(GetDevicePropertyKeysError::Win32Error(win32_error)) => {
+                                debug_assert!(false, "BUG: could not get list of available property keys for the device interface class");
+                                return Err(EnumerateError::Win32Error(win32_error));
+                            }
+                        };
+        
+                        let mut some_device_interface_class_properties = HashMap::<PnpDevicePropertyKey, PnpDevicePropertyValue>::new();
+                        for property_key in available_device_interface_class_property_keys {
+                            let property_value = match get_device_class_property_value(get_device_interface_class_property_class_guid, DeviceClassType::DeviceInterfaceClass, PnpDevicePropertyKey::from(property_key)) {
+                                Ok(value) => value,
+                                Err(GetDevicePropertyValueError::StringDecodingError(decoding_error)) => {
+                                    return Err(EnumerateError::StringDecodingError(decoding_error))
+                                },
+                                Err(GetDevicePropertyValueError::StringListTerminationError) => {
+                                    debug_assert!(false, "BUG: Win32 setupapi's list of strings was not properly terminated with an extra null terminator.");
+                                    return Err(EnumerateError::StringTerminationDecodingError);
+                                },
+                                Err(GetDevicePropertyValueError::StringTerminationError) => {
+                                    debug_assert!(false, "BUG: Win32 setupapi's string (or last string in list of strings) was not properly terminated with a null terminator.");
+                                    return Err(EnumerateError::StringTerminationDecodingError);
+                                },
+                                Err(GetDevicePropertyValueError::Win32Error(win32_error)) => {
+                                    return Err(EnumerateError::Win32Error(win32_error))
+                                },
+                            };
+                            some_device_interface_class_properties.insert(PnpDevicePropertyKey::from(property_key), property_value);
+                        }
+    
+                        device_interface_class_properties = Some(some_device_interface_class_properties);
+                    } else {
+                        device_interface_class_properties = None;
+                    }    
+                } else {
+                    // do not enumerate the device interface class properties (EnumerateOption::IncludeDeviceInterfaceClassProperties omitted)
+                    device_interface_class_properties = None;
+                }
+
                 //
+
+                // determine if this devnode is a device interface; if it is, capture its path and its device interface property values
+                let devnode_is_device_interface: bool;
+
+                // get the device interface details for this device
+                let mut device_interface_data = SP_DEVICE_INTERFACE_DATA { cbSize: 0, InterfaceClassGuid: GUID::from_u128(0), Flags: 0, Reserved: 0 };
+                device_interface_data.cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
                 //
+                let enum_device_interfaces_result: i32;
+                if let Some(some_class_guid) = device_interface_class_guid {
+                    // retrieve an SP_DEVICE_INTERFACE_DATA instance which identifies an interface which meets our search criteria
+                    // https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdienumdeviceinterfaces
+                    enum_device_interfaces_result = unsafe { SetupDiEnumDeviceInterfaces(handle_to_device_info_set, std::ptr::null(), some_class_guid, device_index, &mut device_interface_data) };
+
+                    if enum_device_interfaces_result == 0 {
+                        let win32_error = win32_utils::get_last_error_as_win32_error();
+                        if win32_error == ERROR_NO_MORE_ITEMS {
+                            // we have reached the end of our list successfully OR this devnode is not a device interface; proceed
+                            devnode_is_device_interface = false;
+                        } else {
+                            return Err(EnumerateError::Win32Error(win32_error.0));
+                        }
+                    } else {
+                        devnode_is_device_interface = true;
+                    }
+                } else {
+                    // NOTE: without a supplied device interface class guid, we cannot call SetupDiEnumDeviceInterfaces to extract the device path or other information
+                    //       [if we can find a way to obtain this GUID in the future without asking the user for it, we should do so...and then use it here.]
+                    devnode_is_device_interface = false;
+                    // NOTE: the following code is just an example of a call which _won't_ work, since a zeroed ("nil") guid is not a valid interface guid (or is a hub guid...which is just wrong); don't do this...
+                    // let zeroed_guid = GUID::zeroed();
+                    // enum_device_interfaces_result = unsafe { SetupDiEnumDeviceInterfaces(handle_to_device_info_set, std::ptr::null(), &zeroed_guid, device_index, &mut device_interface_data) };
+                }
+
+                let device_path: Option<String>;
+                let device_interface_properties: Option<HashMap<PnpDevicePropertyKey, PnpDevicePropertyValue>>;
                 //
-                // TODO: capture values for all the other PnpDeviceNodeInfo elements; in the meantime, here are empty fillers
-                let device_instance_properties: Option<HashMap<PnpDevicePropertyKey, PnpDevicePropertyValue>> = None;
-                let device_setup_class_properties: Option<HashMap<PnpDevicePropertyKey, PnpDevicePropertyValue>> = None;
-                let device_path: Option<String> = None;
-                let device_interface_properties: Option<HashMap<PnpDevicePropertyKey, PnpDevicePropertyValue>> = None;
-                let device_interface_class_properties: Option<HashMap<PnpDevicePropertyKey, PnpDevicePropertyValue>> = None;
-                //
-                //
-                //
-                //
-                //
+                if devnode_is_device_interface == true {
+                    // capture the path for this device interface
+                    let some_device_path = match get_device_path_from_device_interface_detail_data(handle_to_device_info_set, &device_interface_data) {
+                        Ok(value) => value,
+                        Err(GetDevicePathFromDeviceInterfaceDetailDataError::StringDecodingError(from_utf16_error)) => {
+                            // NOTE: we may want to consider simply skipping this entry instead of failing hard with an error; there may be scenarios where no path is available or the path is corrupt, etc. (although that seems unlikely)
+                            debug_assert!(false, "BUG: Device interface path could not be decoded");
+                            return Err(EnumerateError::StringDecodingError(from_utf16_error));
+                        },
+                        Err(GetDevicePathFromDeviceInterfaceDetailDataError::Win32Error(win32_error)) => {
+                            return Err(EnumerateError::Win32Error(win32_error));
+                        }
+                    };
+                    device_path = Some(some_device_path);
+
+                    if include_device_interface_properties == true {
+                        // capture the device interface property keys for this device interface
+                        let available_device_interface_property_keys = match get_device_interface_property_keys(handle_to_device_info_set, &mut device_interface_data) {
+                            Ok(value) => value,
+                            Err(GetDevicePropertyKeysError::Win32Error(win32_error)) => {
+                                debug_assert!(false, "BUG: could not get list of available property keys for the device interface");
+                                return Err(EnumerateError::Win32Error(win32_error));
+                            }
+                        };
+                        let mut some_device_interface_properties = HashMap::<PnpDevicePropertyKey, PnpDevicePropertyValue>::new();
+                        for property_key in available_device_interface_property_keys {
+                            let property_value = match get_device_interface_property_value(handle_to_device_info_set, &mut device_interface_data, PnpDevicePropertyKey::from(property_key)) {
+                                Ok(value) => value,
+                                Err(GetDevicePropertyValueError::StringDecodingError(decoding_error)) => {
+                                    return Err(EnumerateError::StringDecodingError(decoding_error));
+                                },
+                                Err(GetDevicePropertyValueError::StringListTerminationError) => {
+                                    debug_assert!(false, "BUG: Win32 setupapi's list of strings was not properly terminated with an extra null terminator.");
+                                    return Err(EnumerateError::StringTerminationDecodingError);
+                                },
+                                Err(GetDevicePropertyValueError::StringTerminationError) => {
+                                    debug_assert!(false, "BUG: Win32 setupapi's string (or last string in list of strings) was not properly terminated with a null terminator.");
+                                    return Err(EnumerateError::StringTerminationDecodingError);
+                                },
+                                Err(GetDevicePropertyValueError::Win32Error(win32_error)) => {
+                                    return Err(EnumerateError::Win32Error(win32_error));
+                                },
+                            };
+                            some_device_interface_properties.insert(PnpDevicePropertyKey::from(property_key), property_value);
+                        }
+                    
+                        device_interface_properties = Some(some_device_interface_properties);
+                    } else {
+                        // do not enumerate the device interface properties (EnumerateOption::IncludeDeviceInterfaceProperties omitted)
+                        device_interface_properties = None;
+                    }
+                } else {
+                    // this devnode is not a device interface, so it has no device path or device instance properties
+                    device_path = None;
+                    device_interface_properties = None;
+                }
 
                 // add this device node's info to our result vector
                 let device_node_info = PnpDeviceNodeInfo {
@@ -356,6 +648,116 @@ fn get_device_instance_id_from_devinfo_data(handle_to_device_info_set: HDEVINFO,
 
 //
 
+enum DeviceClassType {
+    DeviceSetupClass,
+    DeviceInterfaceClass
+}
+
+//
+
+enum GetDevicePropertyKeysError {
+    Win32Error(/*win32_error: */u32),
+}
+
+fn check_setup_di_get_xxx_property_keys_required_size_result(setup_di_get_xxx_property_keys_result: i32, required_property_key_count: u32) -> Result<(), GetDevicePropertyKeysError> {
+    if setup_di_get_xxx_property_keys_result == 0 {
+        let win32_error = win32_utils::get_last_error_as_win32_error();
+        match win32_error {
+            ERROR_INSUFFICIENT_BUFFER => {
+                // this is the expected error condition; we'll resize our buffer to match required_property_key_count
+            },
+            _ => {
+                return Err(GetDevicePropertyKeysError::Win32Error(win32_error.0));
+            }
+        }
+    } else {
+        // return an error if required_property_key_count is non-zero; otherwise, continue with the understanding that the property has a size of zero
+        if required_property_key_count > 0 {
+            // we don't expect the operation to succeed with a null buffer and zero-length buffer size (unless there are no elements to return)
+            debug_assert!(false, "SetupDiGetXXXPropertyKeysW succeeded, even though we passed it no buffer.");
+
+            return Err(GetDevicePropertyKeysError::Win32Error(ERROR_INVALID_DATA.0));
+        }
+    }
+
+    Ok(())
+}
+
+fn get_device_class_property_keys(class_guid: *const GUID, class_type: DeviceClassType) -> Result<Vec<DEVPROPKEY>, GetDevicePropertyKeysError> {
+    let flags: u32;
+    match class_type {
+        DeviceClassType::DeviceSetupClass => {
+            flags = DICLASSPROP_INSTALLER;
+        },
+        DeviceClassType::DeviceInterfaceClass => {
+            flags = DICLASSPROP_INTERFACE;
+        }
+    }
+
+    // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetclasspropertykeys
+    let mut required_property_key_count: u32 = 0;
+    let get_class_property_keys_result = unsafe { SetupDiGetClassPropertyKeys(class_guid, std::ptr::null_mut(), 0, &mut required_property_key_count, flags) };
+    if let Err(error) = check_setup_di_get_xxx_property_keys_required_size_result(get_class_property_keys_result, required_property_key_count) {
+        return Err(error);
+    }
+
+    // retrieve the property keys
+    let mut property_keys_buffer: Vec::<DEVPROPKEY> = Vec::with_capacity(required_property_key_count as usize);
+    property_keys_buffer.resize(property_keys_buffer.capacity(), DEVPROPKEY { fmtid: GUID::from_u128(0), pid: 0 });
+    //
+    let get_class_property_keys_result = unsafe { SetupDiGetClassPropertyKeys(class_guid, property_keys_buffer.as_mut_ptr() as *mut DEVPROPKEY, required_property_key_count, std::ptr::null_mut(), flags) };
+    if get_class_property_keys_result == 0 {
+        let win32_error = win32_utils::get_last_error_as_win32_error();
+        return Err(GetDevicePropertyKeysError::Win32Error(win32_error.0));
+    }
+    
+    Ok(property_keys_buffer)
+}
+
+fn get_device_instance_property_keys(device_info_set: HDEVINFO, devinfo_data: *mut SP_DEVINFO_DATA) -> Result<Vec<DEVPROPKEY>, GetDevicePropertyKeysError> {
+    // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdevicepropertykeys
+    let mut required_property_key_count: u32 = 0;
+    let get_device_property_keys_result = unsafe { SetupDiGetDevicePropertyKeys(device_info_set, devinfo_data, std::ptr::null_mut(), 0, &mut required_property_key_count, 0) };
+    if let Err(error) = check_setup_di_get_xxx_property_keys_required_size_result(get_device_property_keys_result, required_property_key_count) {
+        return Err(error);
+    }
+
+    // retrieve the property keys
+    let mut property_keys_buffer: Vec::<DEVPROPKEY> = Vec::with_capacity(required_property_key_count as usize);
+    property_keys_buffer.resize(property_keys_buffer.capacity(), DEVPROPKEY { fmtid: GUID::from_u128(0), pid: 0 });
+    //
+    let get_device_property_keys_result = unsafe { SetupDiGetDevicePropertyKeys(device_info_set, devinfo_data, property_keys_buffer.as_mut_ptr() as *mut DEVPROPKEY, required_property_key_count, std::ptr::null_mut(), 0) };
+    if get_device_property_keys_result == 0 {
+        let win32_error = win32_utils::get_last_error_as_win32_error();
+        return Err(GetDevicePropertyKeysError::Win32Error(win32_error.0));
+    }
+    
+    Ok(property_keys_buffer)
+}
+
+fn get_device_interface_property_keys(device_info_set: HDEVINFO, device_interface_data: *mut SP_DEVICE_INTERFACE_DATA) -> Result<Vec<DEVPROPKEY>, GetDevicePropertyKeysError> {
+    // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdeviceinterfacepropertykeys
+    let mut required_property_key_count: u32 = 0;
+    let get_device_interface_property_keys_result = unsafe { SetupDiGetDeviceInterfacePropertyKeys(device_info_set, device_interface_data, std::ptr::null_mut(), 0, &mut required_property_key_count, 0) };
+    if let Err(error) = check_setup_di_get_xxx_property_keys_required_size_result(get_device_interface_property_keys_result, required_property_key_count) {
+        return Err(error);
+    }
+
+    // retrieve the property keys
+    let mut property_keys_buffer: Vec::<DEVPROPKEY> = Vec::with_capacity(required_property_key_count as usize);
+    property_keys_buffer.resize(property_keys_buffer.capacity(), DEVPROPKEY { fmtid: GUID::from_u128(0), pid: 0 });
+    //
+    let get_device_interface_property_keys_result = unsafe { SetupDiGetDeviceInterfacePropertyKeys(device_info_set, device_interface_data, property_keys_buffer.as_mut_ptr() as *mut DEVPROPKEY, required_property_key_count, std::ptr::null_mut(), 0) };
+    if get_device_interface_property_keys_result == 0 {
+        let win32_error = win32_utils::get_last_error_as_win32_error();
+        return Err(GetDevicePropertyKeysError::Win32Error(win32_error.0));
+    }
+    
+    Ok(property_keys_buffer)
+}
+
+//
+
 pub enum GetDevicePropertyValueError {
     StringListTerminationError,
     StringDecodingError(/*error: */std::string::FromUtf16Error),
@@ -375,8 +777,8 @@ fn check_setup_di_get_device_xxx_property_required_size_result(setup_di_get_devi
             }
         }
     } else {
-        // we don't expect the operation to succeed with a null buffer and zero-length buffer size.
-        debug_assert!(false, "SetupDiGetDeviceXXXPropertyResultW succeeded, even though we passed it no buffer.");
+        // we don't expect the operation to succeed with a null buffer and zero-length buffer size (as all known/supported property types have a non-zero length).
+        debug_assert!(false, "SetupDiGetDeviceXXXPropertyW succeeded, even though we passed it no buffer.");
 
         // return an error if requiredSize is non-zero; otherwise, continue with the understanding that the property has a size of zero
         if required_size > 0 {
@@ -387,10 +789,104 @@ fn check_setup_di_get_device_xxx_property_required_size_result(setup_di_get_devi
     Ok(())
 }
 
+fn get_device_class_property_value(class_guid: *const GUID, class_type: DeviceClassType, property_key: PnpDevicePropertyKey) -> Result<PnpDevicePropertyValue, GetDevicePropertyValueError> {
+    let flags: u32;
+    match class_type {
+        DeviceClassType::DeviceSetupClass => {
+            flags = DICLASSPROP_INSTALLER;
+        },
+        DeviceClassType::DeviceInterfaceClass => {
+            flags = DICLASSPROP_INTERFACE;
+        }
+    }
+    //
+    let property_key_as_devpropkey = property_key.to_devpropkey();
+
+    // get the type and size of the device setup/interface class property
+    // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetclasspropertyw
+    let mut property_type: u32 = 0;
+    let mut required_size: u32 = 0;
+    let get_class_property_result = unsafe { SetupDiGetClassPropertyW(class_guid, &property_key_as_devpropkey, &mut property_type, std::ptr::null_mut(), 0, &mut required_size, flags) };
+    if let Err(error) = check_setup_di_get_device_xxx_property_required_size_result(get_class_property_result, required_size) {
+        return Err(error);
+    }
+
+    // retrieve the property value
+    let mut property_buffer = Vec::<u8>::with_capacity(required_size as usize);
+    property_buffer.resize(property_buffer.capacity(), 0);
+    //
+    let get_class_property_result = unsafe { SetupDiGetClassPropertyW(class_guid, &property_key_as_devpropkey, &mut property_type, property_buffer.as_mut_ptr() as *mut u8, required_size, std::ptr::null_mut(), flags) };
+    if get_class_property_result == 0 {
+        let win32_error = win32_utils::get_last_error_as_win32_error();
+        return Err(GetDevicePropertyValueError::Win32Error(win32_error.0));
+    }
+
+    // convert the property buffer into a property value
+    let property_value_or_error_result = convert_property_buffer_into_device_property_value(property_buffer, property_type);
+
+    property_value_or_error_result
+}
+
+fn get_device_instance_property_value(device_info_set: HDEVINFO, devinfo_data: *mut SP_DEVINFO_DATA, property_key: PnpDevicePropertyKey) -> Result<PnpDevicePropertyValue, GetDevicePropertyValueError> {
+    let property_key_as_devpropkey = property_key.to_devpropkey();
+
+    // get the type and size of the device instance property
+    // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdevicepropertyw
+    let mut property_type: u32 = 0;
+    let mut required_size: u32 = 0;
+    let get_device_property_result = unsafe { SetupDiGetDevicePropertyW(device_info_set, devinfo_data, &property_key_as_devpropkey, &mut property_type, std::ptr::null_mut(), 0, &mut required_size, 0) };
+    if let Err(error) = check_setup_di_get_device_xxx_property_required_size_result(get_device_property_result, required_size) {
+        return Err(error);
+    }
+
+    // retrieve the property value
+    let mut property_buffer = Vec::<u8>::with_capacity(required_size as usize);
+    property_buffer.resize(property_buffer.capacity(), 0);
+    //
+    let get_device_property_result = unsafe { SetupDiGetDevicePropertyW(device_info_set, devinfo_data, &property_key_as_devpropkey, &mut property_type, property_buffer.as_mut_ptr() as *mut u8, required_size, std::ptr::null_mut(), 0) };
+    if get_device_property_result == 0 {
+        let win32_error = win32_utils::get_last_error_as_win32_error();
+        return Err(GetDevicePropertyValueError::Win32Error(win32_error.0));
+    }
+
+    // convert the property buffer into a property value
+    let property_value_or_error_result = convert_property_buffer_into_device_property_value(property_buffer, property_type);
+
+    property_value_or_error_result
+}
+
+fn get_device_interface_property_value(device_info_set: HDEVINFO, device_interface_data: *mut SP_DEVICE_INTERFACE_DATA, property_key: PnpDevicePropertyKey) -> Result<PnpDevicePropertyValue, GetDevicePropertyValueError> {
+    let property_key_as_devpropkey = property_key.to_devpropkey();
+
+    // get the type and size of the device interface property
+    // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdeviceinterfacepropertyw
+    let mut property_type: u32 = 0;
+    let mut required_size: u32 = 0;
+    let get_device_interface_property_result = unsafe { SetupDiGetDeviceInterfacePropertyW(device_info_set, device_interface_data, &property_key_as_devpropkey, &mut property_type, std::ptr::null_mut(), 0, &mut required_size, 0) };
+    if let Err(error) = check_setup_di_get_device_xxx_property_required_size_result(get_device_interface_property_result, required_size) {
+        return Err(error);
+    }
+
+    // retrieve the property value
+    let mut property_buffer = Vec::<u8>::with_capacity(required_size as usize);
+    property_buffer.resize(property_buffer.capacity(), 0);
+    //
+    let get_device_interface_property_result = unsafe { SetupDiGetDeviceInterfacePropertyW(device_info_set, device_interface_data, &property_key_as_devpropkey, &mut property_type, property_buffer.as_mut_ptr() as *mut u8, required_size, std::ptr::null_mut(), 0) };
+    if get_device_interface_property_result == 0 {
+        let win32_error = win32_utils::get_last_error_as_win32_error();
+        return Err(GetDevicePropertyValueError::Win32Error(win32_error.0));
+    }
+
+    // convert the property buffer into a property value
+    let property_value_or_error_result = convert_property_buffer_into_device_property_value(property_buffer, property_type);
+
+    property_value_or_error_result
+}
+
 //
 
 fn get_device_registry_property_value(device_info_set: HDEVINFO, device_info_data: *mut SP_DEVINFO_DATA, property_key: u32) -> Result<PnpDevicePropertyValue, GetDevicePropertyValueError> {
-    // get the type and size of the device interface property
+    // get the type and size of the device registry property
     // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdeviceregistrypropertyw
     let mut property_registry_data_type_as_u32: u32 = 0;
     let mut required_size: u32 = 0;
@@ -399,7 +895,7 @@ fn get_device_registry_property_value(device_info_set: HDEVINFO, device_info_dat
         return Err(error);
     }
 
-    // retrieve the property
+    // retrieve the property value
     let mut property_buffer = Vec::<u8>::with_capacity(required_size as usize);
     property_buffer.resize(property_buffer.capacity(), 0);
     //
@@ -700,4 +1196,73 @@ fn calculate_mask_to_fit_value(value: u32) -> u32 {
     let result = 0xFFFF_FFFF_u32 >> number_of_high_zero_bits; 
 
     result
+}
+
+//
+
+enum GetDevicePathFromDeviceInterfaceDetailDataError {
+    StringDecodingError(/*error: */std::string::FromUtf16Error),
+    Win32Error(/*win32_error: */u32),
+}
+
+fn get_device_path_from_device_interface_detail_data(handle_to_device_info_set: HDEVINFO, device_interface_data: &SP_DEVICE_INTERFACE_DATA) -> Result<String, GetDevicePathFromDeviceInterfaceDetailDataError> {
+    let device_path: String;
+    
+    // get the size of the SP_DEVICE_INTERFACE_DETAIL_DATA_W structure required to contain the device path; we'll get an error code of ERROR_INSUFFICIENT_BUFFER and the required_size parameter will contain the required size
+    // see: https://learn.microsoft.com/en-us/windows/win32/api/setupapi/nf-setupapi-setupdigetdeviceinterfacedetailw
+    let mut required_size: u32 = 0;
+    let get_device_interface_detail_result = unsafe { SetupDiGetDeviceInterfaceDetailW(handle_to_device_info_set, device_interface_data, std::ptr::null_mut(), 0, &mut required_size, std::ptr::null_mut()) };
+    if get_device_interface_detail_result == 0 {
+        let win32_error = win32_utils::get_last_error_as_win32_error();
+        if win32_error == ERROR_INSUFFICIENT_BUFFER {
+            // this is the expected error (i.e. the error we intentionally induced); continue
+        } else {
+            // otherwise, return the error to our caller
+            return Err(GetDevicePathFromDeviceInterfaceDetailDataError::Win32Error(win32_error.0));
+        }
+    } else {
+        debug_assert!(false, "SetupDiGetDeviceInterfaceDetailW returned success when we asked it for the required buffer size; it should always return false in this circumstance");
+        return Err(GetDevicePathFromDeviceInterfaceDetailDataError::Win32Error(ERROR_INVALID_DATA.0));
+    }
+    //
+    // manually allocate memory for the SP_DEVICE_INTERFACE_DETAIL_DATA_W struct (as it has an ANYSIZE_ARRAY for the [u16] DevicePath)
+    let size_of_struct = match std::mem::size_of::<usize>() {
+        4 => (std::mem::size_of::<u32>() + std::mem::size_of::<u16>()) as u32,
+        _ => std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32 // NOTE: Jan Axelson's "USB Complete 5th ed., p. 253" says to use a size of 8 for 64-bit Windows; if we get errors, we may choose to manually set this to 8 in the future
+    };
+    //
+    let device_interface_detail_data = unsafe { libc::malloc(required_size as usize) as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W };
+    unsafe { (*device_interface_detail_data).cbSize = size_of_struct; }
+    {
+        // free the manually-allocated device_interface_detail_data as soon as we're done using it
+        defer! {
+            unsafe { libc::free(device_interface_detail_data as *mut ::std::os::raw::c_void) };
+        }
+
+        let get_device_interface_detail_result = unsafe { SetupDiGetDeviceInterfaceDetailW(handle_to_device_info_set, device_interface_data, device_interface_detail_data, required_size, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if get_device_interface_detail_result == 0 {
+            let win32_error = win32_utils::get_last_error_as_win32_error();
+            return Err(GetDevicePathFromDeviceInterfaceDetailDataError::Win32Error(win32_error.0));
+        }
+
+        // sanity check: required_size must be greater than 6 (32-bit) or 10 (64-bit)
+        if (required_size as usize) < (std::mem::size_of::<u32>() /* sizeof(.cbSize) */ + std::mem::size_of::<u16>() /* sizeof(u16...null terminator) */) {
+            return Err(GetDevicePathFromDeviceInterfaceDetailDataError::Win32Error(ERROR_INVALID_DATA.0));
+        }
+
+        // copy the device path to a utf16 vector (so that we can then convert it to a string)
+        let device_path_length_in_bytes = (required_size as usize) - std::mem::size_of::<u32>() /* sizeof(.cbSize) */ - std::mem::size_of::<u16>() /* sizeof(u16...null terminator) */;
+        let mut device_path_as_utf16_chars = Vec::<u16>::with_capacity(device_path_length_in_bytes / 2);
+        device_path_as_utf16_chars.resize(device_path_as_utf16_chars.capacity(), 0);
+        //
+        unsafe { std::ptr::copy_nonoverlapping((*device_interface_detail_data).DevicePath.as_ptr(), device_path_as_utf16_chars.as_mut_ptr(), device_path_as_utf16_chars.capacity()); }
+        device_path = match String::from_utf16(&device_path_as_utf16_chars) {
+            Ok(value) => value,
+            Err(decoding_error) => {
+                return Err(GetDevicePathFromDeviceInterfaceDetailDataError::StringDecodingError(decoding_error));
+            }
+        };
+    }
+
+    Ok(device_path)
 }
