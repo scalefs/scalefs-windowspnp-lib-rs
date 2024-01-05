@@ -1,17 +1,17 @@
 // Copyright (c) ScaleFS LLC; used with permission
 // Licensed under the MIT License
 
-use windows_sys::{
-    core::GUID,
-    // Win32::Devices::Properties::DEVPROPTYPE,
-    // Win32::System::Registry::REG_VALUE_TYPE,
-};
+use scalefs_uuid::Uuid;
+// use windows_sys::{
+//     Win32::Devices::Properties::DEVPROPTYPE,
+//     Win32::System::Registry::REG_VALUE_TYPE,
+// };
 
 pub enum PnpDevicePropertyValue {
     ArrayOfValues(/*array: */Vec<PnpDevicePropertyValue>),
     Boolean(/*value: */bool),
     Byte(/*value: */u8),
-    Guid(/*value: */GUID),
+    Guid(/*value: */Uuid),
     ListOfValues(/*list: */Vec<PnpDevicePropertyValue>),
     String(/*value: */String),
     UInt16(/*value: */u16),

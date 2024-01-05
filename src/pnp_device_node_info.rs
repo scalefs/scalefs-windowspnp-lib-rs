@@ -5,14 +5,14 @@ use crate::{
     PnpDevicePropertyKey,
     PnpDevicePropertyValue,
 };
+use scalefs_uuid::Uuid;
 use std::collections::HashMap;
 
 pub struct PnpDeviceNodeInfo {
     // device instance id (applies to all devices)
     pub device_instance_id: String,
-    // NOTE: the container_id is probably unique, but is _not_ guaranteed to be unique; see: https://techcommunity.microsoft.com/t5/microsoft-usb-blog/how-to-generate-a-container-id-for-a-usb-device-part-2/ba-p/270726
-    // NOTE: the container_id should be available for virutally all devices, but perhaps _not_ for root hubs (and maybe not for hubs at all...TBD)
-    pub container_id: Option<String>,
+    // NOTE: the BaseContainerId should be available for virutally all devices, but not for bus drivers or special edge cases (e.g. a volume devnode that spans multiple containers); see: https://learn.microsoft.com/en-us/windows-hardware/drivers/install/overview-of-container-ids
+    pub base_container_id: Option<Uuid>,
     //
     // device instance properties (optional; these should be available for all devices)
     pub device_instance_properties: Option<HashMap<PnpDevicePropertyKey, PnpDevicePropertyValue>>,
